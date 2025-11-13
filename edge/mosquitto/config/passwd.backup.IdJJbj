@@ -1,0 +1,9 @@
+edge_admin:$6$rounds=4096$salt$hash
+edge_sensor_svc:$6$rounds=4096$salt$hash
+edge_agent:$6$rounds=4096$salt$hash
+edge_bridge:$6$rounds=4096$salt$hash
+edge_image_ingest:$6$rounds=4096$salt$hash
+edge_viewer:$6$rounds=4096$salt$hash
+edge_sync_svc:$6$rounds=4096$salt$hash
+edge_scheduler:$6$rounds=4096$salt$hash
+farm-001:$6$rounds=4096$salt$hash

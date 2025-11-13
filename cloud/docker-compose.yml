@@ -1,0 +1,324 @@
+name: farmiq-cloud
+
+networks:
+  farm_cloud:
+    driver: bridge
+
+volumes:
+  kafka_data:
+  timescale-cloud-data:
+  redis-data:
+  redisinsight-data:
+
+services:
+  # 1) TimeSeries DB (TimescaleDB)
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+      TZ: Asia/Bangkok
+    ports:
+      - "25432:5432"
+    expose:
+      - "5432"
+    volumes:
+      - timescale-cloud-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-sensors_db} || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [farm_cloud]
+
+  # --- Kafka (KRaft, single-broker) ---
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: kafka
+    restart: unless-stopped
+    networks: [farm_cloud]
+    ports:
+      - "9094:9094"
+    environment:
+      - KAFKA_ENABLE_KRAFT=yes
+      - KAFKA_CFG_NODE_ID=1
+      - KAFKA_CFG_PROCESS_ROLES=broker,controller
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+    volumes:
+      - kafka_data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      start_period: 40s   # เพิ่มเวลาให้บูต
+      retries: 12
+
+  # one-shot init (หยุดเมื่อทำงานเสร็จ ถือว่าปกติ)
+  kafka-init-topics:
+    image: bitnami/kafka:3.7
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks: [farm_cloud]
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+
+        # ==== ของเดิม (คงไว้เหมือนเดิม) ====
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic sensors.device.readings  --partitions 6 --replication-factor 1
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic sensors.device.health    --partitions 3 --replication-factor 1
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic sensors.lab.readings     --partitions 3 --replication-factor 1
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic sensors.sweep.readings   --partitions 6 --replication-factor 1
+
+        # ==== เพิ่มหัวข้อแบบมีเวอร์ชัน (.v1) ====
+        # Sensors (append-only, เก็บ 365 วัน)
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic sensors.device.readings.v1  --partitions 6 --replication-factor 1 --config retention.ms=31536000000
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic sensors.device.health.v1    --partitions 3 --replication-factor 1 --config retention.ms=15552000000
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic sensors.lab.readings.v1     --partitions 3 --replication-factor 1 --config retention.ms=15552000000
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic sensors.sweep.readings.v1   --partitions 6 --replication-factor 1 --config retention.ms=31536000000
+
+        # Master snapshots (ต้องการค่า "ล่าสุด" → compact)
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic devices.device.snapshot.v1  --partitions 6 --replication-factor 1 --config cleanup.policy=compact
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic farms.farm.snapshot.v1      --partitions 6 --replication-factor 1 --config cleanup.policy=compact
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic farms.house.snapshot.v1     --partitions 6 --replication-factor 1 --config cleanup.policy=compact
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic farms.flock.snapshot.v1     --partitions 6 --replication-factor 1 --config cleanup.policy=compact
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic formula.recipe.snapshot.v1  --partitions 3 --replication-factor 1 --config cleanup.policy=compact
+            
+        # Operational / Feed / Economics / External (append-only, 180 วัน)
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic farms.operational.event.v1      --partitions 6 --replication-factor 1 --config retention.ms=15552000000
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic feed.batch.created.v1           --partitions 6 --replication-factor 1 --config retention.ms=15552000000
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic feed.quality.result.v1          --partitions 3 --replication-factor 1 --config retention.ms=15552000000
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic economics.cost.txn.v1           --partitions 6 --replication-factor 1 --config retention.ms=31536000000
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic external.weather.observation.v1 --partitions 6 --replication-factor 1 --config retention.ms=15552000000
+
+        # Analytics outputs (append-only, 90 วัน)
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic analytics.features.materialized.v1 --partitions 6 --replication-factor 1 --config retention.ms=7776000000
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic analytics.prediction.v1           --partitions 6 --replication-factor 1 --config retention.ms=7776000000
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic analytics.anomaly.v1              --partitions 6 --replication-factor 1 --config retention.ms=7776000000
+
+        # DLQ (30 วัน) — อย่างน้อยสำหรับสตรีมหลัก
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic sensors.device.readings.v1.dlq      --partitions 6 --replication-factor 1 --config retention.ms=2592000000
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic farms.operational.event.v1.dlq      --partitions 6 --replication-factor 1 --config retention.ms=2592000000
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic feed.batch.created.v1.dlq           --partitions 6 --replication-factor 1 --config retention.ms=2592000000
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic external.weather.observation.v1.dlq --partitions 3 --replication-factor 1 --config retention.ms=2592000000
+
+        # List สรุป
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+    restart: "no" 
+
+  # --- Kafka UI ---
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    environment:
+      SERVER_PORT: 8080
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_PROPERTIES_SECURITY_PROTOCOL: PLAINTEXT
+    networks: [farm_cloud]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks: [farm_cloud]   # <-- ใช้ชื่อเดียวกับที่ประกาศด้านบน
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # 📊 Full-featured GUI by Redis
+  redisinsight:
+    image: redis/redisinsight:latest
+    restart: unless-stopped
+    ports:
+      - "5540:5540"        # ✅ host:container (v2 ฟังที่ 5540)
+    volumes:
+      - redisinsight-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks: [farm_cloud]
+    # (ออปชัน) healthcheck ของ UI เอง
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5540/api/health/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # 5) auth-service (ตัวอย่าง)
+  auth-service:
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile
+    container_name: auth-service
+    restart: unless-stopped
+    ports:
+      - "${AUTH_PORT:-7300}:7300"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "postgresql://${DB_USER}:${DB_PASSWORD}@timescaledb:5432/${DB_NAME}"
+      DB_SCHEMA: sensors
+      ENV_PATH: /app/.env
+    networks: [farm_cloud]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "http=require('http');http.get('http://localhost:7300/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+  # 6) customer-service (disabled - service not found)
+  # customer-service:
+  #   build:
+  #     context: ./services/customer-service
+  #     dockerfile: Dockerfile
+  #   container_name: customer-service
+  #   restart: unless-stopped
+  #   ports:
+  #     - "${CUSTOMER_SERVICE_PORT:-7301}:${CUSTOMER_SERVICE_PORT:-7301}"
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     DATABASE_URL: "postgresql://${DB_USER}:${DB_PASSWORD}@timescaledb:5432/${DB_NAME}"
+  #     NODE_ENV: "production"
+  #     ENV_PATH: /app/.env
+  #   networks: [farm_cloud]
+  #   depends_on:
+  #     timescaledb:
+  #       condition: service_healthy
+  #   healthcheck:
+  #     test:
+  #       ["CMD","node","-e","http=require('http');p=process.env.CUSTOMER_SERVICE_PORT||'7301';http.get(`http://localhost:${p}/health`,r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+  #     interval: 10s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 10s
+
+  # 7) sensor-streamer-service (ของใหม่)
+  sensor-streamer:
+    build:
+      context: ./services/sensor-streamer-service
+      dockerfile: Dockerfile
+    container_name: sensor-streamer
+    restart: unless-stopped
+    ports:
+      - "${SENSOR_STREAMER_PORT:-7302}:7302"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "postgresql://${DB_USER}:${DB_PASSWORD}@timescaledb:5432/${DB_NAME}"
+      DB_SCHEMA: sensors
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_SSL: "false"
+      ENV_PATH: /app/.env
+    networks: [farm_cloud]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "http=require('http');http.get('http://localhost:7302/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+  analytics-stream:
+    build:
+      context: ./services/analytic/services/analytics-stream   # ✅ path ถูก
+      dockerfile: Dockerfile
+    container_name: analytics-stream
+    restart: unless-stopped
+    env_file:
+      - ./services/analytic/services/analytics-stream/.env     # ✅ path ถูก
+    environment:
+      # ถ้าใน .env ตั้ง REDIS_URL เป็นอย่างอื่น จะ override ให้ตรง container นี้
+      NODE_ENV: production
+      TZ: Asia/Bangkok
+      REDIS_URL: redis://redis:6379
+    networks: [farm_cloud]
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "7303:7303"
+    healthcheck:
+      test: ["CMD", "node", "-e", "http=require('http');http.get('http://localhost:7303/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  analytics-worker:
+    build:
+      context: ./services/analytic/services/analytics-worker   # ✅ path ถูก
+      dockerfile: Dockerfile
+    container_name: analytics-worker
+    restart: unless-stopped
+    env_file:
+      - ./services/analytic/services/analytics-worker/.env     # ✅ path ถูก
+    environment:
+      TZ: Asia/Bangkok
+      ENABLE_WORKER: "1"        # รัน Kafka worker
+      ENABLE_SCHEDULER: "1"     # รัน APScheduler (KPI/ฯลฯ)
+    networks: [farm_cloud]
+    depends_on:
+      kafka:
+        condition: service_started   # ถ้ามี healthcheck ใน kafka ใช้ service_healthy ได้
+      timescaledb:
+        condition: service_started
+    ports:
+      - "7304:7304"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:7304/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  analytics-api:
+    build:
+      context: ./services/analytic/services/analytics-api
+      dockerfile: Dockerfile
+    container_name: analytics-api
+    restart: unless-stopped
+    env_file:
+      - ./services/analytic/services/analytics-api/.env
+    environment:
+      TZ: Asia/Bangkok
+      API_HOST: "0.0.0.0"
+    depends_on:
+      timescaledb:
+        condition: service_started
+    networks: [farm_cloud]
+    ports:
+      - "7305:7305"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; u='http://localhost:7305/v1/health'; sys.exit(0 if urllib.request.urlopen(u,timeout=3).getcode()==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s

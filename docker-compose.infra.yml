@@ -1,0 +1,132 @@
+name: agroatlas
+
+volumes:
+  pgdata:
+  redis-data:
+  redisinsight-data:
+  minio-data:
+  rabbitmq-data:
+  kafka-data:
+
+networks:
+  agroatlas-network:
+    name: agroatlas-network
+    driver: bridge
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: agroatlas
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres1611
+    ports:
+      - "15432:5432"   # host ใช้ 15432, ใน container อ้าง postgres:5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d agroatlas"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [agroatlas-network]
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+    volumes: [ "redis-data:/data" ]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [agroatlas-network]
+    restart: unless-stopped
+
+  redisinsight:
+    image: redis/redisinsight:latest
+    ports: ["8001:8001"]
+    volumes: [ "redisinsight-data:/data" ]
+    depends_on: [redis]
+    networks: [agroatlas-network]
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [ "minio-data:/data" ]
+    networks: [agroatlas-network]
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports: ["5672:5672", "15672:15672"]
+    environment:
+      RABBITMQ_DEFAULT_USER: rabbitmq
+      RABBITMQ_DEFAULT_PASS: rabbitmq
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [agroatlas-network]
+    restart: unless-stopped
+
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: farmiq-kafka
+    environment:
+      - KAFKA_CFG_NODE_ID=0
+      - KAFKA_CFG_PROCESS_ROLES=controller,broker
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9093
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka-data:/bitnami/kafka
+      - ./cloud/kafka-topics.yml:/opt/kafka-topics.yml:ro
+    networks: [agroatlas-network]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  kafka-init-topics:
+    image: bitnami/kafka:3.7
+    container_name: farmiq-kafka-init-topics
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./cloud/scripts/create-kafka-topics.sh:/create-kafka-topics.sh:ro
+      - ./cloud/kafka-topics.yml:/kafka-topics.yml:ro
+    command: >
+      bash -c "
+        echo 'Waiting for Kafka to be ready...'
+        sleep 10
+        echo 'Creating Kafka topics...'
+        chmod +x /create-kafka-topics.sh
+        /create-kafka-topics.sh
+        echo 'Kafka topics initialization completed!'
+      "
+    networks: [agroatlas-network]
+    restart: "no"

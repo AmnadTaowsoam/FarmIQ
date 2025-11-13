@@ -1,0 +1,1 @@
+"""Stereo capture service package."""

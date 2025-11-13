@@ -1,0 +1,63 @@
+// Sensor Service Prisma Schema
+// Uses shared database with separate schema for microservice isolation
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  schemas  = ["sensors", "public"]
+}
+
+generator client {
+  provider = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-1.1.x", "debian-openssl-3.0.x"]
+}
+
+// Sensor Service Models
+model DeviceReading {
+  time            DateTime @db.Timestamptz
+  tenantId        String   @map("tenant_id")
+  robotId         String   @map("robot_id")
+  deviceId        String   @map("device_id")
+  metric          String
+  value           Float
+  quality         String
+  payload         Json?
+
+  @@id([time, tenantId, robotId, deviceId, metric])
+  @@map("device_readings")
+  @@schema("sensors")
+}
+
+model DeviceHealth {
+  time            DateTime @db.Timestamptz
+  tenantId        String   @map("tenant_id")
+  deviceId        String   @map("device_id")
+  online          Boolean?
+  source          String?
+  rssi            Int?
+  uptimeS         Int?     @map("uptime_s")
+  meta            Json?
+
+  @@id([time, tenantId, deviceId])
+  @@map("device_health")
+  @@schema("sensors")
+}
+
+model SweepReading {
+  time            DateTime @db.Timestamptz
+  tenantId        String   @map("tenant_id")
+  robotId         String   @map("robot_id")
+  runId           Int      @map("run_id")
+  sensorId        String   @map("sensor_id")
+  metric          String
+  zoneId          String?  @map("zone_id")
+  x               Float?
+  y               Float?
+  value           Float
+  quality         String
+  payload         Json?
+
+  @@id([time, robotId, runId, sensorId, metric])
+  @@map("sweep_readings")
+  @@schema("sensors")
+}

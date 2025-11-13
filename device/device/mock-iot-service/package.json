@@ -1,0 +1,22 @@
+{
+  "name": "mock-iot-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "cross-env MQTT_URL=mqtt://localhost:1883 ENV_SENSORS_ENABLED=true WATER_SENSORS_ENABLED=true FEED_SENSOR_ENABLED=true CAPTURE_ENABLED=false VISION_INFERENCE_ENABLED=false node src/index.js",
+    "dev": "cross-env NODE_ENV=development node src/index.js"
+  },
+  "dependencies": {
+    "@faker-js/faker": "^9.0.0",
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "form-data": "^4.0.0",
+    "mqtt": "^5.3.4",
+    "pino": "^9.2.0",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "cross-env": "^10.0.0"
+  }
+}

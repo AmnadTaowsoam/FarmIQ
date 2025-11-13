@@ -1,0 +1,40 @@
+{
+  "name": "image-ingestion-service",
+  "version": "1.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Receive images via HTTP, store in MinIO, persist metadata in TimescaleDB, and publish events to RabbitMQ.",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "ts-node-dev --transpile-only --respawn src/server.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.1.0",
+    "@fastify/helmet": "^13.0.1",
+    "@fastify/multipart": "^9.0.0",
+    "@fastify/swagger": "^9.5.1",
+    "@fastify/swagger-ui": "^5.2.3",
+    "@prisma/client": "^6.16.2",
+    "dotenv": "^16.4.5",
+    "fastify": "^5.6.0",
+    "jsonwebtoken": "^9.0.2",
+    "minio": "^8.0.1",
+    "mqtt": "^5.13.1",
+    "pg": "^8.11.5",
+    "reflect-metadata": "^0.1.13",
+    "sharp": "^0.33.3",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@asteasolutions/zod-to-openapi": "^8.1.0",
+    "@types/cors": "^2.8.19",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^20.11.30",
+    "prisma": "^6.16.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.3.3"
+  },
+  "resolutions": {}
+}
