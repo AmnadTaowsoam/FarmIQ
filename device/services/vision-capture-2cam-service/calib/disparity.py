@@ -1,49 +1,65 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
+"""
+Stereo disparity viewer + height measurement over a plate.
+
+ออกแบบให้:
+- ใช้ ROI ใหญ่ครอบทั้ง plate ได้
+- ความสูง H คำนวณจาก depth reference ของ EMPTY plate ต่อพิกเซล (per-pixel)
+- กรอง noise ด้วยเกณฑ์ขั้นต่ำของความสูง (H_MIN_MM)
+"""
+
+import sys
+from collections import deque
+from urllib.parse import quote
+
 import cv2
 import numpy as np
-from urllib.parse import quote
-import sys
-from collections import deque  # [Step 1] ใช้สำหรับ temporal smoothing
 
-# ให้ Python เห็น package app
+# เพิ่ม path ไปยัง package app ของ service นี้
 sys.path.append(r"D:\FarmIQ\device\services\vision-capture-2cam-service")
 from app.stereo_calib_utils import StereoRectifier
 
+
 CALIB_YML = r"D:\FarmIQ\device\services\vision-capture-2cam-service\calib\stereo_rectify_maps.yml"
 
-# ---------- ตัวแปร Global สำหรับ Calibration ----------
-Z_PLATE_REF = None          # จะเซ็ตตอนกดปุ่ม 's' (depth ของพื้น plate)
-SCALE_MM_PER_UNIT = None    # scale แปลงหน่วย Z → mm
-H_KNOWN_MM = 217.0          # ความสูงบล็อกที่ใช้ calibrate (เช่น 217 mm)
+# ---------- Global calibration state ----------
+Z_PLATE_REF = None          # depth ของ plate ตอนกด 's' (หน่วยเดียวกับ Q)
+SCALE_MM_PER_UNIT = None    # scale แปลง unitZ → mm
+H_KNOWN_MM = 217.0          # ความสูง block ที่รู้จริง (ใช้ตอน 'c' override scale)
 
-# ใช้ระยะจริงจากกล้องถึง plate (วัดจริง ~ 1020 mm)
-PLATE_DISTANCE_MM = 1020.0
+PLATE_DISTANCE_MM = 1020.0  # ระยะกล้องถึง plate (ใช้คำนวณ SCALE_MM_PER_UNIT)
 
-# [Step 1] ประวัติ Z สำหรับทำ temporal smoothing
-Z_HISTORY = deque(maxlen=5)
+# ความสูงขั้นต่ำที่จะถือว่า "มีวัตถุ" (mm)
+H_MIN_MM = 20.0
 
-# [Step 3] World-plane calibration (สำหรับ metrology)
-PLATE_PLANE_NORMAL = None   # normal vector ของ plane พื้น plate
-PLATE_PLANE_D = None        # d ในสมการ plane: n·X + d = 0
-Z_PLATE_NOISE_UNITS = None
+Z_HISTORY = deque(maxlen=3)  # smoothing สำหรับค่า height (ในหน่วย depth)
 
-# ---------- ฟังก์ชัน crop โซน plate (ใช้ค่าสำหรับทั้ง L/R เหมือนกัน) ----------
-def crop_plate_roi(img,top_ratio=0.12,bottom_ratio=0.00,side_ratio=0.18):
-    """ตัดขอบภาพออกให้เหลือเน้นบริเวณ plate"""
+# แผนที่ depth reference ของ EMPTY plate (หน่วยเดียวกับ Z) สำหรับ ROI
+Z_PLATE_REF_MAP = None      # shape เท่ากับ roi_Z_clean
+
+# ค่า height ล่าสุด (หน่วย depth) สำหรับปุ่ม 'c'
+LAST_HEIGHT_UNITS = None
+
+
+def crop_plate_roi(img, top_ratio=0.12, bottom_ratio=0.00, side_ratio=0.18):
+    """
+    ครอปเฉพาะบริเวณ plate จากภาพ rectified (ตัดขอบบน/ล่าง/ซ้าย/ขวาออกตามสัดส่วน)
+    """
     h, w = img.shape[:2]
-    top    = int(h * top_ratio)
+    top = int(h * top_ratio)
     bottom = int(h * (1.0 - bottom_ratio))
-    left   = int(w * side_ratio)
-    right  = int(w * (1.0 - side_ratio))
+    left = int(w * side_ratio)
+    right = int(w * (1.0 - side_ratio))
 
-    top    = max(0, min(top, h - 1))
+    top = max(0, min(top, h - 1))
     bottom = max(top + 1, min(bottom, h))
-    left   = max(0, min(left, w - 1))
-    right  = max(left + 1, min(right, w))
+    left = max(0, min(left, w - 1))
+    right = max(left + 1, min(right, w))
 
     return img[top:bottom, left:right]
 
-def load_Q_from_yml(calib_path: str):
+
+def load_Q_from_yml(calib_path: str) -> np.ndarray:
     fs = cv2.FileStorage(calib_path, cv2.FILE_STORAGE_READ)
     if not fs.isOpened():
         raise RuntimeError(f"Cannot open calib file: {calib_path}")
@@ -54,15 +70,16 @@ def load_Q_from_yml(calib_path: str):
     print("Loaded Q from calib, shape:", Q.shape)
     return Q
 
-# [Step 1] ฟังก์ชัน clean depth ใน ROI (ตัด outlier)
+
 def clean_depth_roi(roi_Z: np.ndarray):
     """
-    รับ depth_Z ใน ROI (2D) แล้ว:
-    - ตัดค่า NaN / inf ทิ้ง
-    - ใช้ 3σ จาก median ตัด outlier
+    ทำความสะอาด depth_Z ใน ROI (2D):
+    - กรอง NaN / inf ทิ้ง
+    - กรอง outlier ที่เกิน 3*std รอบ median
+
     คืนค่า:
-      roi_Z_clean : depth ที่ outlier ถูกแทนด้วย NaN
-      valid_vals  : ค่า depth ที่ยัง valid หลัง clean
+        roi_Z_clean : depth หลังตัด outlier (ตำแหน่ง outlier จะเป็น NaN)
+        valid_vals  : 1D array ของค่าที่ valid
     """
     finite_mask = np.isfinite(roi_Z)
     if not np.any(finite_mask):
@@ -73,7 +90,6 @@ def clean_depth_roi(roi_Z: np.ndarray):
     std = np.std(vals)
 
     if std < 1e-6:
-        # depth ค่อนข้างนิ่ง ไม่ต้องตัด outlier เพิ่ม
         return roi_Z, vals
 
     z_low = med - 3.0 * std
@@ -87,35 +103,14 @@ def clean_depth_roi(roi_Z: np.ndarray):
     return roi_clean, valid_vals
 
 
-# [Step 3] ฟังก์ชัน fit plane สำหรับ world coordinate (metrology)
-def fit_plane_from_points(points3d: np.ndarray):
-    """
-    รับจุด 3D (N,3) แล้ว fit plane แบบ least squares:
-        n·X + d = 0
-    คืนค่า:
-        normal (3,), d (scalar)
-    """
-    if points3d.shape[0] < 3:
-        raise ValueError("Need at least 3 points to fit a plane")
-
-    centroid = points3d.mean(axis=0)
-    uu, ss, vv = np.linalg.svd(points3d - centroid)
-    normal = vv[-1, :]
-    normal = normal / np.linalg.norm(normal)
-    d = -np.dot(normal, centroid)
-    return normal, d
-
-
 def main():
-    global Z_PLATE_REF, SCALE_MM_PER_UNIT, PLATE_PLANE_NORMAL, PLATE_PLANE_D
-    global Z_PLATE_NOISE_UNITS
+    global Z_PLATE_REF, SCALE_MM_PER_UNIT, Z_PLATE_REF_MAP, LAST_HEIGHT_UNITS
 
-    # ---------- โหลด calibration + rectify maps ----------
     rectifier = StereoRectifier()
     Q = load_Q_from_yml(CALIB_YML)
 
-    # ---------- เปิดกล้องผ่าน RTSP ----------
-    pwd = quote('P@ssw0rd', safe='')  # encode @
+    # ---------- RTSP config ----------
+    pwd = quote("P@ssw0rd", safe="")  # encode @
     urlL = f"rtsp://admin:{pwd}@192.168.1.199:554/Streaming/Channels/101"
     urlR = f"rtsp://admin:{pwd}@192.168.1.200:554/Streaming/Channels/101"
 
@@ -123,16 +118,24 @@ def main():
     capR = cv2.VideoCapture(urlR, cv2.CAP_FFMPEG)
 
     if not capL.isOpened() or not capR.isOpened():
-        print("เปิดสตรีม RTSP ไม่ได้ ตรวจสอบ IP/รหัสผ่าน/สาย LAN")
+        print("Cannot open RTSP streams, please check IP/credential/network")
         return
 
-    print("Camera L size:", capL.get(cv2.CAP_PROP_FRAME_WIDTH), capL.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print("Camera R size:",capR.get(cv2.CAP_PROP_FRAME_WIDTH), capR.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(
+        "Camera L size:",
+        capL.get(cv2.CAP_PROP_FRAME_WIDTH),
+        capL.get(cv2.CAP_PROP_FRAME_HEIGHT),
+    )
+    print(
+        "Camera R size:",
+        capR.get(cv2.CAP_PROP_FRAME_WIDTH),
+        capR.get(cv2.CAP_PROP_FRAME_HEIGHT),
+    )
 
-    # ---------- สร้าง StereoSGBM (ตัวคำนวณ disparity) ----------
+    # ---------- StereoSGBM ----------
     stereo = cv2.StereoSGBM_create(
         minDisparity=0,
-        numDisparities=16 * 48,  # 768 px (ต้องหาร 16 ลงตัว และ < ความกว้างภาพ)
+        numDisparities=16 * 48,  # 768 px (ต้องหาร 16 ลงตัว)
         blockSize=9,
         P1=8 * 3 * 9 ** 2,
         P2=32 * 3 * 9 ** 2,
@@ -141,12 +144,13 @@ def main():
         speckleWindowSize=50,
         speckleRange=2,
         preFilterCap=63,
-        mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
+        mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
     )
 
-    TARGET_SHOW_WIDTH = 1920      # ไว้ใช้กับแต่ละ window แยก
-    DEBUG_WIDTH = 1280            # ขนาด window รวม 3 รูป
+    TARGET_SHOW_WIDTH = 1920
+    DEBUG_WIDTH = 1280
     DEBUG_HEIGHT = 980
+
     printed_stats = False
     printed_z_stats = False
 
@@ -155,15 +159,27 @@ def main():
         retR, frameR = capR.read()
 
         if not retL or not retR:
-            print("ไม่สามารถอ่านภาพจากสตรีมได้")
-            break
+            print("Failed to read from cameras, try reconnect...")
+            # ปิด stream เดิมแล้วลองเปิดใหม่อีกครั้ง
+            capL.release()
+            capR.release()
+
+            capL = cv2.VideoCapture(urlL, cv2.CAP_FFMPEG)
+            capR = cv2.VideoCapture(urlR, cv2.CAP_FFMPEG)
+
+            if not capL.isOpened() or not capR.isOpened():
+                print("Reconnect failed, exit program")
+                break
+
+            print("Reconnect success")
+            continue
 
         # ---------- 1) Rectify ----------
         rectL, rectR = rectifier.rectify(frameL, frameR)
 
-        # ---------- 2) Crop เฉพาะโซน plate ----------
-        rectL_crop = crop_plate_roi(rectL, top_ratio=0.12,bottom_ratio=0.00, side_ratio=0.18)
-        rectR_crop = crop_plate_roi(rectR, top_ratio=0.12,bottom_ratio=0.00, side_ratio=0.18)
+        # ---------- 2) Crop ให้เหลือเฉพาะ plate ----------
+        rectL_crop = crop_plate_roi(rectL, top_ratio=0.12, bottom_ratio=0.00, side_ratio=0.18)
+        rectR_crop = crop_plate_roi(rectR, top_ratio=0.12, bottom_ratio=0.00, side_ratio=0.18)
 
         # ---------- 3) Gray ----------
         grayL = cv2.cvtColor(rectL_crop, cv2.COLOR_BGR2GRAY)
@@ -176,15 +192,15 @@ def main():
             valid_all = disp_raw[disp_raw > 0]
             if valid_all.size > 0:
                 p5, p50, p95 = np.percentile(valid_all, [5, 50, 95])
-                print("disp_raw min/max:", np.min(valid_all), np.max(valid_all))
-                print("disp_raw p5/p50/p95:", p5, p50, p95)
+                print("disp_raw min/max:", float(np.min(valid_all)), float(np.max(valid_all)))
+                print("disp_raw p5/p50/p95:", float(p5), float(p50), float(p95))
             else:
                 print("no valid disparity")
             printed_stats = True
 
         # เตรียม disparity สำหรับ visualization + depth
         disp = disp_raw.copy()
-        disp[disp <= 0] = np.nan  # invalid -> NaN
+        disp[disp <= 0] = np.nan
 
         disp_for_depth = disp_raw.copy()
         disp_for_depth[disp_for_depth <= 0] = 0
@@ -193,34 +209,24 @@ def main():
         points_3d = cv2.reprojectImageTo3D(disp_for_depth, Q)  # (H, W, 3)
         depth_Z = points_3d[:, :, 2]
 
-        # ---------- 5) ROI รอบจาน ----------
+        # ---------- 5) ROI บน disparity/3D ----------
         h, w = disp.shape
 
-        # ---- ปรับตำแหน่ง / ขนาด ROI ด้วยสัดส่วน ----
-        ROI_CENTER_X_RATIO = 0.30   # center plate ~30% จากซ้าย
-        ROI_CENTER_Y_RATIO = 0.54   # กลางภาพแนวตั้ง
-        ROI_WIDTH_RATIO  = 0.60     # กว้าง ~60% ของภาพ
-        ROI_HEIGHT_RATIO = 0.90     # สูง ~90% ของภาพ
+        ROI_CENTER_X_RATIO = 0.30
+        ROI_CENTER_Y_RATIO = 0.54
+        ROI_WIDTH_RATIO = 0.60
+        ROI_HEIGHT_RATIO = 0.90
 
-        # คำนวณ center ของ ROI ด้วย ratio
         cx = int(w * ROI_CENTER_X_RATIO)
         cy = int(h * ROI_CENTER_Y_RATIO)
-
-        half_w = int(w * ROI_WIDTH_RATIO  / 2.0)
+        half_w = int(w * ROI_WIDTH_RATIO / 2.0)
         half_h = int(h * ROI_HEIGHT_RATIO / 2.0)
 
-        roi_x1 = cx - half_w
-        roi_x2 = cx + half_w
-        roi_y1 = cy - half_h
-        roi_y2 = cy + half_h
+        roi_x1 = max(0, cx - half_w)
+        roi_x2 = min(w, cx + half_w)
+        roi_y1 = max(0, cy - half_h)
+        roi_y2 = min(h, cy + half_h)
 
-        # บังคับไม่ให้หลุดขอบภาพ
-        roi_x1 = max(0, roi_x1)
-        roi_y1 = max(0, roi_y1)
-        roi_x2 = min(w, roi_x2)
-        roi_y2 = min(h, roi_y2)
-
-        # ---------- 5.0) สร้าง mask disparity ภายใน ROI ----------
         roi_disp = disp[roi_y1:roi_y2, roi_x1:roi_x2]
         valid_disp_roi = roi_disp[~np.isnan(roi_disp) & (roi_disp > 0)]
 
@@ -240,109 +246,158 @@ def main():
         disp_uint8 = (disp_norm * 255).astype(np.uint8)
         disp_color = cv2.applyColorMap(disp_uint8, cv2.COLORMAP_JET)
 
-        # ---------- 5.1) Clean Depth + Temporal smoothing ----------
+        # ---------- 5.1) Clean depth ----------
         roi_Z = depth_Z[roi_y1:roi_y2, roi_x1:roi_x2]
         roi_Z_clean, valid_Z_roi = clean_depth_roi(roi_Z)
 
         if not printed_z_stats and valid_Z_roi.size > 0:
-            print("ROI Z min/max:", np.min(valid_Z_roi), np.max(valid_Z_roi))
+            print("ROI Z min/max:", float(np.min(valid_Z_roi)), float(np.max(valid_Z_roi)))
             printed_z_stats = True
 
-        Z_obj_smooth = None
+        # bounding box ของ object (ในพิกัด ROI) เอาไว้ใช้ตอนวาด
+        obj_bbox = None  # (x, y, w, h)
 
-        if valid_Z_roi.size > 0:
-            if Z_PLATE_REF is None:
-                # ยังไม่ได้ตั้ง reference → ใช้ median ทั้ง ROI ให้นิ่งเฉย ๆ
-                Z_med = np.median(valid_Z_roi)
-                Z_HISTORY.append(Z_med)
-                Z_obj_smooth = np.median(Z_HISTORY)
+        height_units_smooth = None
+
+        # ---------- 5.1.1) คำนวณ metric_map (ความสูงเหนือ plate) + หา blob ----------
+        if valid_Z_roi.size > 0 and Z_PLATE_REF_MAP is not None:
+            if Z_PLATE_REF_MAP.shape != roi_Z_clean.shape:
+                # ถ้า ROI เปลี่ยนขนาด ให้ล้าง map แล้วให้กด 's' ใหม่
+                Z_PLATE_REF_MAP = None
             else:
-                # หลังมี reference แล้ว → วัตถุ = จุดที่เบี่ยงจากพื้นมากกว่า noise
-                dZ_map = Z_PLATE_REF - roi_Z_clean  # หน่วยเดียวกับ depth
+                metric_map = Z_PLATE_REF_MAP - roi_Z_clean  # >0 = สูงกว่า plate
+                metric_valid = metric_map[np.isfinite(metric_map)]
 
-                # กำหนด threshold ตาม noise ของพื้น
-                if Z_PLATE_NOISE_UNITS is not None:
-                    MIN_DZ_UNITS = 3.0 * Z_PLATE_NOISE_UNITS  # วัตถุต้องสูงกว่า 3*noise
+                # แปลง H_MIN_MM เป็นหน่วย depth เป็น threshold ขั้นต่ำ
+                if SCALE_MM_PER_UNIT is not None and SCALE_MM_PER_UNIT > 1e-6:
+                    MIN_DZ_UNITS = H_MIN_MM / SCALE_MM_PER_UNIT
                 else:
-                    MIN_DZ_UNITS = 1500.0  # fallback ~170mm (0.112mm/unit)
-                MAX_DZ_UNITS = 50000.0
+                    MIN_DZ_UNITS = 80.0  # ประมาณ ~9mm ถ้า scale ~0.11mm/unit
 
+                MAX_DZ_UNITS = 50000.0
+                # จำนวน pixel ขั้นต่ำของ blob ใหญ่พอจะถือเป็นวัตถุ
+                MIN_OBJ_PIXELS = 300
+
+                # mask พื้นที่ที่ "สูงกว่า" plate ตาม threshold
                 mask_obj = (
-                    np.isfinite(dZ_map) &
-                    (np.abs(dZ_map) > MIN_DZ_UNITS) &
-                    (np.abs(dZ_map) < MAX_DZ_UNITS)
+                    np.isfinite(metric_map)
+                    & (metric_map > MIN_DZ_UNITS)
+                    & (metric_map < MAX_DZ_UNITS)
                 )
 
-                # ต้องมี pixel วัตถุเยอะพอ ไม่งั้นถือว่าไม่มีวัตถุ
-                MIN_OBJ_PIXELS = 500  # ปรับได้ตามขนาดกล่องที่ใช้จริง
-                num_obj = np.count_nonzero(mask_obj)
+                num_obj = int(np.count_nonzero(mask_obj))
 
                 if num_obj >= MIN_OBJ_PIXELS:
-                    obj_Z_vals = roi_Z_clean[mask_obj]
-                    Z_med = np.median(obj_Z_vals)
-                    Z_HISTORY.append(Z_med)
-                    Z_obj_smooth = np.median(Z_HISTORY)
+                    # ---------- หา blob ใหญ่สุดจาก mask_obj ----------
+                    mask_uint8 = np.zeros_like(metric_map, dtype=np.uint8)
+                    mask_uint8[mask_obj] = 255
+
+                    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                        mask_uint8, connectivity=8
+                    )
+
+                    # label 0 คือ background ข้ามไป
+                    best_label = -1
+                    best_area = 0
+                    best_bbox = None
+                    for label in range(1, num_labels):
+                        x, y, w_box, h_box, area = stats[label]
+                        if area > best_area:
+                            best_area = area
+                            best_label = label
+                            best_bbox = (x, y, w_box, h_box)
+
+                    if best_label != -1 and best_area >= MIN_OBJ_PIXELS:
+                        obj_bbox = best_bbox
+                        blob_mask = labels == best_label
+                        obj_vals = metric_map[blob_mask]
+
+                        # ใช้ percentile สูงหน่อยเพื่อลดผลจากขอบเอียงของกล่อง
+                        metric_height = float(
+                            np.nanpercentile(obj_vals, 90)
+                        )
+                        Z_HISTORY.append(metric_height)
+                        height_units_smooth = float(np.median(Z_HISTORY))
+
+                # debug log
+                if metric_valid.size > 0:
+                    pos_vals = metric_valid[metric_valid > 0]
+                    dZ_pos_max = float(np.max(pos_vals)) if pos_vals.size > 0 else 0.0
                 else:
-                    Z_obj_smooth = None
+                    dZ_pos_max = 0.0
 
-        # ---------- 5.2) Depth + RGB พร้อมใช้งาน ----------
-        roi_rgb = rectL_crop[roi_y1:roi_y2, roi_x1:roi_x2]
-        roi_points_3d = points_3d[roi_y1:roi_y2, roi_x1:roi_x2, :]
-        # (hook ไปใช้ต่อในระบบจริง เช่น วัด H/Volume)
+                print(
+                    f"[DBG] MIN_DZ={MIN_DZ_UNITS:.1f}, "
+                    f"dZ_pos_max={dZ_pos_max:.1f}, obj_pixels={num_obj}"
+                )
 
-        # ---------- 5.3) แสดงผลความสูง ----------
+        LAST_HEIGHT_UNITS = height_units_smooth
+
+        # ---------- 5.2) Text แสดงความสูง ----------
         text = ""
-        if Z_PLATE_REF is None:
+        if Z_PLATE_REF is None or Z_PLATE_REF_MAP is None:
             text = f"Press 's' on EMPTY plate ({PLATE_DISTANCE_MM:.0f}mm)"
         elif SCALE_MM_PER_UNIT is None:
             text = f"Press 'c' with {H_KNOWN_MM:.0f}mm block (optional)"
-        elif Z_obj_smooth is None:
-            # มี reference แล้ว แต่ไม่เจอวัตถุที่สูงกว่าพื้น
+        elif height_units_smooth is None:
             text = "H ~ 0.0 mm (no object)"
         else:
-            dZ = Z_PLATE_REF - Z_obj_smooth
-            height_mm = abs(dZ) * SCALE_MM_PER_UNIT
-            text = f"H ~ {height_mm:.1f} mm"
+            height_mm = abs(height_units_smooth) * SCALE_MM_PER_UNIT
+            if height_mm < H_MIN_MM:
+                text = "H ~ 0.0 mm (no object)"
+            else:
+                text = f"H ~ {height_mm:.1f} mm"
 
         if text:
-            cv2.putText(disp_color,text,(30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA,)
+            cv2.putText(
+                disp_color,
+                text,
+                (30, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
 
-        # ---------- 6) เตรียมภาพไว้ดูเทียบ ----------
+        # ---------- 6) เตรียมภาพสำหรับแสดง ----------
         raw_pair = cv2.hconcat([frameL, frameR])
         rect_pair = cv2.hconcat([rectL_crop, rectR_crop])
 
-        # วาดกรอบ ROI บนภาพ Rectified
-        cv2.rectangle(rect_pair, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 0, 255), 2,)
+        # วาดกรอบ ROI
+        cv2.rectangle(rect_pair, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 0, 255), 2)
+        disp_debug = disp_color.copy()
+        cv2.rectangle(disp_debug, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 255, 255), 2)
+
+        # ถ้ามี bounding box ของ object ให้วาดเพิ่ม (ทั้งบน rectified และ disparity)
+        if obj_bbox is not None:
+            x_b, y_b, w_b, h_b = obj_bbox
+            pt1 = (roi_x1 + x_b, roi_y1 + y_b)
+            pt2 = (roi_x1 + x_b + w_b, roi_y1 + y_b + h_b)
+            cv2.rectangle(rect_pair, pt1, pt2, (0, 255, 0), 2)
+            cv2.rectangle(disp_debug, pt1, pt2, (0, 255, 0), 2)
 
         def resize_to_width(img, target_w):
             h0, w0 = img.shape[:2]
             scale = target_w / float(w0)
             return cv2.resize(img, (target_w, int(h0 * scale)))
 
-        # window แยกแต่ละตัว (ยังใช้ 1920 ได้ตามเดิม)
-        raw_show  = resize_to_width(raw_pair,  TARGET_SHOW_WIDTH)
+        raw_show = resize_to_width(raw_pair, TARGET_SHOW_WIDTH)
         rect_show = resize_to_width(rect_pair, TARGET_SHOW_WIDTH)
-
-        disp_debug = disp_color.copy()
-        cv2.rectangle(disp_debug, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 255, 255), 2,)
         disp_show = resize_to_width(disp_debug, TARGET_SHOW_WIDTH)
 
-        # เส้นเขียวบน rectified
+        # เส้นแนวนอนช่วยเช็ค rectification
         h_show, w_show, _ = rect_show.shape
         for y in range(100, h_show, 100):
             cv2.line(rect_show, (0, y), (w_show, y), (0, 255, 0), 1)
 
-        # ---------- 6.1) สร้าง Stereo Debug (3 รูปในเฟรมเดียว) ----------
-        stage_h = DEBUG_HEIGHT // 3  # สูงของแต่ละแถวใน debug window
-
-        raw_dbg  = cv2.resize(raw_pair,  (DEBUG_WIDTH, stage_h))
+        # Stereo Debug window
+        stage_h = DEBUG_HEIGHT // 3
+        raw_dbg = cv2.resize(raw_pair, (DEBUG_WIDTH, stage_h))
         rect_dbg = cv2.resize(rect_pair, (DEBUG_WIDTH, stage_h))
         disp_dbg = cv2.resize(disp_debug, (DEBUG_WIDTH, stage_h))
-
         debug_all = cv2.vconcat([raw_dbg, rect_dbg, disp_dbg])
 
-
-        # ---------- 7) แสดงผล ----------
         cv2.imshow("Raw stereo (L|R)", raw_show)
         cv2.imshow("Rectified + Cropped (L|R)", rect_show)
         cv2.imshow("Disparity Map", disp_show)
@@ -350,23 +405,18 @@ def main():
 
         # ---------- 8) Key handling ----------
         key = cv2.waitKey(1) & 0xFF
-        if key == 27 or key == ord('q'):
+
+        if key == 27 or key == ord("q"):
             break
 
-        elif key == ord('s'):
-            # คาลิเบรต Z ของพื้น plate (ตอน plate ว่าง)
+        elif key == ord("s"):
+            # กดบน EMPTY plate เพื่อตั้ง depth reference + scale
             if valid_Z_roi.size > 0:
-                Z_PLATE_REF = np.median(valid_Z_roi)
-
-                # เคลียร์ history
+                Z_PLATE_REF = float(np.nanmedian(valid_Z_roi))
+                Z_PLATE_REF_MAP = roi_Z_clean.copy()
                 Z_HISTORY.clear()
-                Z_HISTORY.append(Z_PLATE_REF)
 
-                # ประเมิน noise ของพื้นจากความต่างรอบ ๆ median
-                diff = roi_Z_clean - Z_PLATE_REF
-                Z_PLATE_NOISE_UNITS = np.nanpercentile(np.abs(diff), 99)
                 print(f"[CALIB] plate depth (units) = {Z_PLATE_REF:.3f}")
-                print(f"[CALIB] plate noise (units, p99) = {Z_PLATE_NOISE_UNITS:.1f}")
 
                 if abs(Z_PLATE_REF) > 1e-3:
                     SCALE_MM_PER_UNIT = PLATE_DISTANCE_MM / abs(Z_PLATE_REF)
@@ -378,49 +428,26 @@ def main():
             else:
                 print("[CALIB] No valid depth in ROI to save for plate")
 
-
-        elif key == ord('c'):
-            # OPTIONAL: override scale ด้วยบล็อกที่รู้ความสูง H_KNOWN_MM
-            if Z_PLATE_REF is None:
+        elif key == ord("c"):
+            # ใช้ block ความสูง H_KNOWN_MM เพื่อ override scale
+            if Z_PLATE_REF is None or Z_PLATE_REF_MAP is None:
                 print("[CALIB] Press 's' on EMPTY plate first")
-            elif Z_obj_smooth is None:
-                print("[CALIB] No valid depth in ROI for block")
+            elif LAST_HEIGHT_UNITS is None:
+                print("[CALIB] No valid height in ROI for block")
             else:
-                Z_block = Z_obj_smooth
-                dZ = Z_PLATE_REF - Z_block
-                if abs(dZ) < 0.5:
+                d_units = LAST_HEIGHT_UNITS
+                if abs(d_units) < 0.5:
                     print(
-                        f"[CALIB] dZ={dZ:.4f} too small, "
+                        f"[CALIB] dZ={d_units:.4f} too small, "
                         "move block / check setup"
                     )
                 else:
-                    SCALE_MM_PER_UNIT = H_KNOWN_MM / abs(dZ)
+                    SCALE_MM_PER_UNIT = H_KNOWN_MM / abs(d_units)
                     print(
                         f"[CALIB] SCALE override "
                         f"(from {H_KNOWN_MM:.1f}mm block) "
-                        f"= {SCALE_MM_PER_UNIT:.6f} mm/unitZ (dZ={dZ:.6f})"
+                        f"= {SCALE_MM_PER_UNIT:.6f} mm/unitZ (dZ={d_units:.6f})"
                     )
-
-        elif key == ord('w'):
-            # [Step 3] คาลิเบรต World Coordinate (fit plane ของ plate)
-            roi_pts = roi_points_3d[np.isfinite(roi_Z_clean)]
-            if roi_pts.shape[0] < 50:
-                print("[WORLD] Not enough 3D points in ROI to fit plane")
-            else:
-                try:
-                    n, d = fit_plane_from_points(roi_pts)
-                    PLATE_PLANE_NORMAL = n
-                    PLATE_PLANE_D = d
-                    print(f"[WORLD] Plate plane: n={n}, d={d}")
-                    print(
-                        "[WORLD] Use distance = n·X + d "
-                        "as world-height above plate"
-                    )
-                except Exception as e:
-                    print("[WORLD] Plane fit error:", e)
-
-        # ---------- 9) (Optional - AI Depth Refinement hook) ----------
-        # ตรงนี้เตรียมไว้ต่อโมเดล AI ได้ในอนาคต
 
     capL.release()
     capR.release()
